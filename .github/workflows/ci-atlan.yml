@@ -1,0 +1,187 @@
+name: Atlan CI
+
+on:
+  push:
+    branches:
+      - "fix1"
+
+env:
+  dockerhub_publish: ${{ secrets.DOCKER_HUB_PAT_RW != '' }}
+
+jobs:
+  
+  meta:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      container_tags: ${{ steps.docker_action_meta.outputs.tags }}
+      container_labels: ${{ steps.docker_action_meta.outputs.labels }}
+      container_buildtime: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.created'] }}
+      container_version: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.version'] }}
+      container_revision: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Docker meta
+        id: docker_action_meta
+        uses: docker/metadata-action@v5.9.0
+        with:
+          images: |
+            name=ghcr.io/atlanhq/s3proxy
+            name=atlanhq/s3proxy,enable=${{ env.dockerhub_publish }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=sha,format=long
+            type=sha
+            type=match,pattern=s3proxy-(.*),group=1
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+  runTests:
+    runs-on: ubuntu-24.04-arm
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: "recursive"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      #Run tests
+      - name: Maven Set version
+        run: |
+          mvn versions:set -DnewVersion=${{ needs.meta.outputs.version }}
+      - name: Maven Package
+        run: |
+          mvn verify -DskipTests
+      - name: Maven Test
+        run: |
+          mvn test
+
+      - name: Maven Test with transient-nio2
+        run: |
+          # TODO: run other test classes
+          mvn test -Ds3proxy.test.conf=s3proxy-transient-nio2.conf -Dtest=AwsSdkTest
+
+      - name: Maven Test with filesystem-nio2
+        run: |
+          # TODO: run other test classes
+          mkdir /tmp/blobstore
+          mvn test -Ds3proxy.test.conf=s3proxy-filesystem-nio2.conf -Dtest=AwsSdkTest
+
+      - name: Install Azurite
+        run: npx --yes --loglevel info azurite@3.35 --version
+      - name: Start Azurite
+        shell: bash
+        run: npx --yes azurite@3.35 azurite-blob &
+      - name: Maven Test with Azurite
+        run: |
+          # TODO: run other test classes
+          mvn test -Ds3proxy.test.conf=s3proxy-azurite.conf -Dtest=AwsSdkTest
+
+      - name: Install LocalStack
+        run: docker pull localstack/localstack:4.11.1
+      - name: Start LocalStack
+        run: |
+          docker run -d --name localstack -p 4566:4566 localstack/localstack:4.11.1
+          # Wait for LocalStack to be ready
+          for i in $(seq 30); do
+            if curl -s http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              break
+            fi
+            sleep 1
+          done
+      - name: Maven Test with LocalStack
+        run: |
+          # TODO: run other test classes
+          mvn test -Ds3proxy.test.conf=s3proxy-localstack.conf -Dtest=AwsSdkTest
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests
+        run: |
+          ./src/test/resources/run-s3-tests.sh
+      - name: Run s3-tests with transient-nio2
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-transient-nio2.conf
+      - name: Run s3-tests with Azurite
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-azurite.conf
+          kill $(pidof node)
+      - name: Run s3-tests with LocalStack
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-localstack.conf
+          docker stop localstack
+
+      #Store the target
+      - uses: actions/upload-artifact@v5
+        with:
+          name: s3proxy
+          path: target/s3proxy
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pom
+          path: pom.xml
+
+  Containerize:
+    runs-on: ubuntu-24.04-arm
+    needs: [runTests, meta]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
+        with:
+          name: s3proxy
+          path: target
+      - uses: actions/download-artifact@v6
+        with:
+          name: pom
+          path: .
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request' && env.dockerhub_publish == 'true'
+        with:
+          username: atlanhq
+          password: ${{ secrets.DOCKER_HUB_PAT_RW }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ needs.meta.outputs.container_tags }}
+          labels: ${{ needs.meta.outputs.container_labels }}
+          build-args: |
+            BUILDTIME=${{ needs.meta.outputs.container_buildtime }}
+            VERSION=${{ needs.meta.outputs.container_version }}
+            REVISION=${{ needs.meta.outputs.container_revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
