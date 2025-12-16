@@ -1,0 +1,16 @@
+name: s3proxy
+id: ari:cloud:compass:ab230fbd-f58b-455c-b827-5e7b862fca76:component/5f7e7797-0b2b-41b5-8f36-0f91364f7707/28502591-6038-414e-bf96-0975d9590ebd
+description: Access other storage backends via the S3 API
+configVersion: 1
+typeId: SERVICE
+fields:
+  tier: 4
+links:
+  - name: null
+    type: REPOSITORY
+    url: https://github.com/atlanhq/s3proxy
+relationships:
+  DEPENDS_ON: []
+labels:
+  - source:github
+customFields: null
