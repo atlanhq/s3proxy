@@ -25,3 +25,5 @@ target/
 __blobstorage__/
 AzuriteConfig
 __azurite_db*
+
+__private__/
