@@ -28,7 +28,7 @@ jobs:
         with:
           images: |
             name=ghcr.io/atlanhq/s3proxy
-            name=atlanhq/s3proxy,enable=${{ secrets.DOCKER_HUB_PAT_RW }}
+            name=registry-1.docker.io/atlanhq/atlanhq/s3proxy
           flavor: |
             latest=auto
           tags: |
