@@ -1769,7 +1769,6 @@ public class S3ProxyHandler {
         }
 
         String range = request.getHeader(HttpHeaders.RANGE);
-        logger.info("handleGetBlob {} Range: {}", blobName, range);
         if (range != null && range.startsWith("bytes=") &&
                 // ignore multiple ranges
                 range.indexOf(',') == -1) {
@@ -1791,6 +1790,8 @@ public class S3ProxyHandler {
             throw new S3Exception(S3ErrorCode.NO_SUCH_KEY);
         }
 
+        response.setStatus(status);
+
         addCorsResponseHeader(request, response);
 
         addMetadataToResponse(request, response, blob.getMetadata());
@@ -1801,34 +1802,11 @@ public class S3ProxyHandler {
         Collection<String> contentRanges =
                 headers.get(HttpHeaders.CONTENT_RANGE);
         if (!contentRanges.isEmpty()) {
-            String contentRange = contentRanges.iterator().next();
-            logger.info("handleGetBlob {} Content-Range from backend: {}",
-                    blobName, contentRange);
-            if (status == HttpServletResponse.SC_PARTIAL_CONTENT &&
-                    isFullContentRange(contentRange)) {
-                // Range covers the entire object. Return 200 OK so
-                // that S3 clients (e.g. AWS SDK) do not treat the
-                // response as a partial download and retry.
-                // TEMPORARILY DISABLED to test if Content-Length fix
-                // alone is sufficient.
-                // status = HttpServletResponse.SC_OK;
-                logger.info("handleGetBlob {} full-content range, " +
-                        "keeping 206 (test)", blobName);
-            }
-            // Always forward Content-Range for this test
             response.addHeader(HttpHeaders.CONTENT_RANGE,
-                    contentRange);
+                    contentRanges.iterator().next());
             response.addHeader(HttpHeaders.ACCEPT_RANGES,
                     "bytes");
         }
-
-        Long contentLength = blob.getMetadata().getContentMetadata()
-                .getContentLength();
-        logger.info("handleGetBlob {} responding status={} " +
-                "Content-Length={} contentRanges={}",
-                blobName, status, contentLength, contentRanges);
-
-        response.setStatus(status);
 
         try (InputStream is = blob.getPayload().openStream();
              OutputStream os = response.getOutputStream()) {
@@ -3284,28 +3262,6 @@ public class S3ProxyHandler {
             eTag = "\"" + eTag + "\"";
         }
         return eTag;
-    }
-
-    /** Return true when Content-Range spans the entire object. */
-    private static boolean isFullContentRange(String contentRange) {
-        // Format: "bytes START-END/TOTAL"
-        if (!contentRange.startsWith("bytes ")) {
-            return false;
-        }
-        try {
-            String spec = contentRange.substring("bytes ".length());
-            int slash = spec.indexOf('/');
-            if (slash == -1) {
-                return false;
-            }
-            long total = Long.parseLong(spec.substring(slash + 1));
-            String[] range = spec.substring(0, slash).split("-", 2);
-            long start = Long.parseLong(range[0]);
-            long end = Long.parseLong(range[1]);
-            return start == 0 && end == total - 1;
-        } catch (NumberFormatException | IndexOutOfBoundsException e) {
-            return false;
-        }
     }
 
     private static boolean startsWithIgnoreCase(String string, String prefix) {
