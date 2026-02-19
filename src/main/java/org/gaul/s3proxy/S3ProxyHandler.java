@@ -1809,15 +1809,17 @@ public class S3ProxyHandler {
                 // Range covers the entire object. Return 200 OK so
                 // that S3 clients (e.g. AWS SDK) do not treat the
                 // response as a partial download and retry.
-                status = HttpServletResponse.SC_OK;
+                // TEMPORARILY DISABLED to test if Content-Length fix
+                // alone is sufficient.
+                // status = HttpServletResponse.SC_OK;
                 logger.info("handleGetBlob {} full-content range, " +
-                        "downgrading 206 → 200", blobName);
-            } else {
-                response.addHeader(HttpHeaders.CONTENT_RANGE,
-                        contentRange);
-                response.addHeader(HttpHeaders.ACCEPT_RANGES,
-                        "bytes");
+                        "keeping 206 (test)", blobName);
             }
+            // Always forward Content-Range for this test
+            response.addHeader(HttpHeaders.CONTENT_RANGE,
+                    contentRange);
+            response.addHeader(HttpHeaders.ACCEPT_RANGES,
+                    "bytes");
         }
 
         Long contentLength = blob.getMetadata().getContentMetadata()
