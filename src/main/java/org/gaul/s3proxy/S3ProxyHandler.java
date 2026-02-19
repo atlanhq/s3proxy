@@ -1790,8 +1790,6 @@ public class S3ProxyHandler {
             throw new S3Exception(S3ErrorCode.NO_SUCH_KEY);
         }
 
-        response.setStatus(status);
-
         addCorsResponseHeader(request, response);
 
         addMetadataToResponse(request, response, blob.getMetadata());
@@ -1802,11 +1800,22 @@ public class S3ProxyHandler {
         Collection<String> contentRanges =
                 headers.get(HttpHeaders.CONTENT_RANGE);
         if (!contentRanges.isEmpty()) {
-            response.addHeader(HttpHeaders.CONTENT_RANGE,
-                    contentRanges.iterator().next());
-            response.addHeader(HttpHeaders.ACCEPT_RANGES,
-                    "bytes");
+            String contentRange = contentRanges.iterator().next();
+            if (status == HttpServletResponse.SC_PARTIAL_CONTENT &&
+                    isFullContentRange(contentRange)) {
+                // Range covers the entire object. Return 200 OK so
+                // that S3 clients (e.g. AWS SDK) do not treat the
+                // response as a partial download and retry.
+                status = HttpServletResponse.SC_OK;
+            } else {
+                response.addHeader(HttpHeaders.CONTENT_RANGE,
+                        contentRange);
+                response.addHeader(HttpHeaders.ACCEPT_RANGES,
+                        "bytes");
+            }
         }
+
+        response.setStatus(status);
 
         try (InputStream is = blob.getPayload().openStream();
              OutputStream os = response.getOutputStream()) {
@@ -3262,6 +3271,28 @@ public class S3ProxyHandler {
             eTag = "\"" + eTag + "\"";
         }
         return eTag;
+    }
+
+    /** Return true when Content-Range spans the entire object. */
+    private static boolean isFullContentRange(String contentRange) {
+        // Format: "bytes START-END/TOTAL"
+        if (!contentRange.startsWith("bytes ")) {
+            return false;
+        }
+        try {
+            String spec = contentRange.substring("bytes ".length());
+            int slash = spec.indexOf('/');
+            if (slash == -1) {
+                return false;
+            }
+            long total = Long.parseLong(spec.substring(slash + 1));
+            String[] range = spec.substring(0, slash).split("-", 2);
+            long start = Long.parseLong(range[0]);
+            long end = Long.parseLong(range[1]);
+            return start == 0 && end == total - 1;
+        } catch (NumberFormatException | IndexOutOfBoundsException e) {
+            return false;
+        }
     }
 
     private static boolean startsWithIgnoreCase(String string, String prefix) {

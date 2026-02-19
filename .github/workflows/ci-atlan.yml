@@ -3,7 +3,7 @@ name: Atlan CI
 on:
   push:
     branches:
-      - "fix1"
+      - "fix2"
 
 
 jobs:
