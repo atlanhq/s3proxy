@@ -1769,6 +1769,7 @@ public class S3ProxyHandler {
         }
 
         String range = request.getHeader(HttpHeaders.RANGE);
+        logger.info("handleGetBlob {} Range: {}", blobName, range);
         if (range != null && range.startsWith("bytes=") &&
                 // ignore multiple ranges
                 range.indexOf(',') == -1) {
@@ -1801,12 +1802,16 @@ public class S3ProxyHandler {
                 headers.get(HttpHeaders.CONTENT_RANGE);
         if (!contentRanges.isEmpty()) {
             String contentRange = contentRanges.iterator().next();
+            logger.info("handleGetBlob {} Content-Range from backend: {}",
+                    blobName, contentRange);
             if (status == HttpServletResponse.SC_PARTIAL_CONTENT &&
                     isFullContentRange(contentRange)) {
                 // Range covers the entire object. Return 200 OK so
                 // that S3 clients (e.g. AWS SDK) do not treat the
                 // response as a partial download and retry.
                 status = HttpServletResponse.SC_OK;
+                logger.info("handleGetBlob {} full-content range, " +
+                        "downgrading 206 → 200", blobName);
             } else {
                 response.addHeader(HttpHeaders.CONTENT_RANGE,
                         contentRange);
@@ -1814,6 +1819,12 @@ public class S3ProxyHandler {
                         "bytes");
             }
         }
+
+        Long contentLength = blob.getMetadata().getContentMetadata()
+                .getContentLength();
+        logger.info("handleGetBlob {} responding status={} " +
+                "Content-Length={} contentRanges={}",
+                blobName, status, contentLength, contentRanges);
 
         response.setStatus(status);
 
