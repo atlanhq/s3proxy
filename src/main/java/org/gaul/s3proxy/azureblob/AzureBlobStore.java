@@ -345,15 +345,19 @@ public final class AzureBlobStore extends BaseBlobStore {
         }
         var properties = blobStream.getProperties();
         var expires = properties.getExpiresOn();
+        long blobSize = properties.getBlobSize();
         long contentLength;
         if (azureRange == null) {
-            contentLength = properties.getBlobSize();
+            contentLength = blobSize;
         } else {
+            // Clamp to actual blob size — the requested range may
+            // extend beyond the object (e.g. Range: bytes=0-5242879
+            // on a 131-byte file).
+            long available = blobSize - azureRange.getOffset();
             if (azureRange.getCount() == null) {
-                contentLength = properties.getBlobSize() -
-                        azureRange.getOffset();
+                contentLength = available;
             } else {
-                contentLength = azureRange.getCount();
+                contentLength = Math.min(azureRange.getCount(), available);
             }
         }
         var blob = new BlobBuilderImpl()
@@ -372,7 +376,7 @@ public final class AzureBlobStore extends BaseBlobStore {
             blob.getAllHeaders().put(HttpHeaders.CONTENT_RANGE,
                     "bytes " + azureRange.getOffset() +
                     "-" + (azureRange.getOffset() + contentLength - 1) +
-                    "/" + properties.getBlobSize());
+                    "/" + blobSize);
         }
         var metadata = blob.getMetadata();
         metadata.setETag(properties.getETag());
