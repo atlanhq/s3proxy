@@ -7,7 +7,7 @@ on:
 
 
 jobs:
-  
+
   meta:
     runs-on: ubuntu-24.04-arm
     outputs:
@@ -40,6 +40,34 @@ jobs:
             type=ref,event=tag
           labels: |
             org.opencontainers.image.licenses=Apache-2.0
+
+  build:
+    runs-on: ubuntu-24.04-arm
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+      - name: Maven Set version
+        run: |
+          mvn versions:set -DnewVersion=${{ needs.meta.outputs.container_version }}
+      - name: Maven Package
+        run: |
+          mvn verify -DskipTests
+      - uses: actions/upload-artifact@v5
+        with:
+          name: s3proxy
+          path: target/s3proxy
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pom
+          path: pom.xml
+
   runTests:
     runs-on: ubuntu-24.04-arm
     needs: [meta]
@@ -58,10 +86,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      #Run tests
       - name: Maven Set version
         run: |
-          mvn versions:set -DnewVersion=${{ needs.meta.outputs.version }}
+          mvn versions:set -DnewVersion=${{ needs.meta.outputs.container_version }}
       - name: Maven Package
         run: |
           mvn verify -DskipTests
@@ -126,19 +153,9 @@ jobs:
           ./src/test/resources/run-s3-tests.sh s3proxy-localstack.conf
           docker stop localstack
 
-      #Store the target
-      - uses: actions/upload-artifact@v5
-        with:
-          name: s3proxy
-          path: target/s3proxy
-      - uses: actions/upload-artifact@v5
-        with:
-          name: pom
-          path: pom.xml
-
   Containerize:
     runs-on: ubuntu-24.04-arm
-    needs: [runTests, meta]
+    needs: [build, meta]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v6
