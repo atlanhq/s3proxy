@@ -2351,6 +2351,50 @@ public class S3ProxyHandler {
         }
     }
 
+    // Number of times to poll for a freshly combined GCS group object before
+    // giving up, and the base back-off between polls (grows linearly).
+    private static final int GCS_COMBINE_VISIBILITY_ATTEMPTS = 5;
+    private static final long GCS_COMBINE_VISIBILITY_BACKOFF_MILLIS = 200;
+
+    // Verify every combined-group object produced by the GCS recursive combine
+    // is readable before handing the list to jclouds' completeMultipartUpload,
+    // which dereferences each part object without a null-check and would throw
+    // a NullPointerException (surfacing as MalformedXML) on a missing object.
+    // getMPUPartName() in jclouds names the part object "<uploadId>_<part:08d>",
+    // so we probe the same names here.
+    private void ensureGcsCombinedGroupsVisible(BlobStore blobStore,
+            String containerName, MultipartUpload mpu,
+            List<MultipartPart> parts) throws S3Exception {
+        for (MultipartPart part : parts) {
+            String partObjectName = String.format(
+                    "%s_%08d", mpu.id(), part.partNumber());
+            BlobMetadata partMetadata = null;
+            for (int attempt = 0;
+                    attempt < GCS_COMBINE_VISIBILITY_ATTEMPTS; ++attempt) {
+                partMetadata = blobStore.blobMetadata(
+                        containerName, partObjectName);
+                if (partMetadata != null) {
+                    break;
+                }
+                try {
+                    Thread.sleep(GCS_COMBINE_VISIBILITY_BACKOFF_MILLIS
+                            * (attempt + 1));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (partMetadata == null) {
+                logger.error("GCS multipart complete for upload {}: combined "
+                        + "group object {} is not readable after {} attempts; "
+                        + "failing cleanly instead of NPE-ing in jclouds "
+                        + "completeMultipartUpload", mpu.id(), partObjectName,
+                        GCS_COMBINE_VISIBILITY_ATTEMPTS);
+                throw new S3Exception(S3ErrorCode.INTERNAL_ERROR);
+            }
+        }
+    }
+
     private void handleCompleteMultipartUpload(HttpServletRequest request,
             HttpServletResponse response, InputStream is,
             final BlobStore blobStore, String containerName, String blobName,
@@ -2434,6 +2478,21 @@ public class S3ProxyHandler {
                 parts.add(MultipartPart.create(
                         partNumber, partSize, eTag, /*lastModified=*/ null));
             }
+            // The outer completeMultipartUpload below is delegated to jclouds'
+            // GoogleCloudStorageBlobStore.completeMultipartUpload, which builds
+            // its compose source list via
+            //   objectsBuilder.add(api.getObjectApi().getObject(container,
+            //           getMPUPartName(mpu, part.partNumber())))
+            // with no null-check. When a combined-group object is not yet
+            // readable (GCS read-after-write lag on a freshly composed object)
+            // or is genuinely absent, getObject(...) returns null and
+            // ImmutableList.Builder.add(null) throws a NullPointerException that
+            // surfaces to the client as an opaque MalformedXML. This only bites
+            // uploads large enough to need the recursive combine (> 32 parts),
+            // e.g. multi-GB column.json. Confirm each combined-group object is
+            // visible first -- retrying briefly for consistency -- so we either
+            // proceed cleanly or fail with an actionable error instead of an NPE.
+            ensureGcsCombinedGroupsVisible(blobStore, containerName, mpu, parts);
         } else {
             // List parts to get part sizes and to map multiple Azure parts
             // into single parts.
