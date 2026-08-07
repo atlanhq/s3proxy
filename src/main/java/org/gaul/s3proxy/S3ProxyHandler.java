@@ -2351,6 +2351,40 @@ public class S3ProxyHandler {
         }
     }
 
+    /**
+     * Combine GCS multipart parts into per-group composite objects.
+     *
+     * GCS compose accepts at most 32 sources, so uploadPart groups parts
+     * 32-at-a-time under {@code <uploadId>_<group>} and this combines each
+     * group into one object, yielding the parts for the final compose.
+     *
+     * This is O(parts) sequential round trips -- ~2000 for a 12 GiB upload at
+     * 8 MiB parts -- so callers must run it where the client is being kept
+     * alive, not before the response has started.
+     */
+    private static void combineGcsParts(BlobStore blobStore,
+            MultipartUpload mpu, String containerName, BlobMetadata metadata,
+            PutOptions options, List<MultipartPart> parts) {
+        for (int partNumber = 1;; ++partNumber) {
+            MultipartUpload mpu2 = MultipartUpload.create(
+                    containerName,
+                    String.format("%s_%08d", mpu.id(), partNumber),
+                    String.format("%s_%08d", mpu.id(), partNumber),
+                    metadata, options);
+            List<MultipartPart> subParts = blobStore.listMultipartUpload(mpu2);
+            if (subParts.isEmpty()) {
+                break;
+            }
+            long partSize = 0;
+            for (MultipartPart part : subParts) {
+                partSize += part.partSize();
+            }
+            String eTag = blobStore.completeMultipartUpload(mpu2, subParts);
+            parts.add(MultipartPart.create(
+                    partNumber, partSize, eTag, /*lastModified=*/ null));
+        }
+    }
+
     private void handleCompleteMultipartUpload(HttpServletRequest request,
             HttpServletResponse response, InputStream is,
             final BlobStore blobStore, String containerName, String blobName,
@@ -2382,6 +2416,12 @@ public class S3ProxyHandler {
 
         final List<MultipartPart> parts = new ArrayList<>();
         String blobStoreType = getBlobStoreType(blobStore);
+        // GCS has no native multipart upload: s3proxy emulates it with
+        // compose, which accepts at most 32 sources, so parts are combined
+        // recursively in groups of 32 at complete time.
+        final boolean gcsRecursiveCombine =
+                blobStoreType.equals("google-cloud-storage");
+        boolean hasGcsParts = false;
         if (blobStoreType.equals("azureblob")) {
             for (MultipartPart part : blobStore.listMultipartUpload(mpu)) {
                 parts.add(part);
@@ -2412,28 +2452,20 @@ public class S3ProxyHandler {
                 }
                 parts.addAll(partsMap.values());
             }
-        } else if (blobStoreType.equals("google-cloud-storage")) {
-            // GCS only supports 32 parts but we can support up to 1024 by
-            // recursively combining objects.
-            for (int partNumber = 1;; ++partNumber) {
-                MultipartUpload mpu2 = MultipartUpload.create(
-                        containerName,
-                        String.format("%s_%08d", mpu.id(), partNumber),
-                        String.format("%s_%08d", mpu.id(), partNumber),
-                        metadata, options);
-                List<MultipartPart> subParts = blobStore.listMultipartUpload(
-                        mpu2);
-                if (subParts.isEmpty()) {
-                    break;
-                }
-                long partSize = 0;
-                for (MultipartPart part : subParts) {
-                    partSize += part.partSize();
-                }
-                String eTag = blobStore.completeMultipartUpload(mpu2, subParts);
-                parts.add(MultipartPart.create(
-                        partNumber, partSize, eTag, /*lastModified=*/ null));
-            }
+        } else if (gcsRecursiveCombine) {
+            // The recursive combine itself is deferred to the keepalive
+            // thread below -- it is the long pole for large uploads and
+            // running it here would leave the client on a silent connection
+            // for its whole duration.  Probe the first group only, so an
+            // upload with no parts still fails with MALFORMED_X_M_L before
+            // the response is committed, exactly as it did before.
+            MultipartUpload firstGroup = MultipartUpload.create(
+                    containerName,
+                    String.format("%s_%08d", mpu.id(), 1),
+                    String.format("%s_%08d", mpu.id(), 1),
+                    metadata, options);
+            hasGcsParts = !blobStore.listMultipartUpload(
+                    firstGroup).isEmpty();
         } else {
             // List parts to get part sizes and to map multiple Azure parts
             // into single parts.
@@ -2480,7 +2512,7 @@ public class S3ProxyHandler {
             }
         }
 
-        if (parts.isEmpty()) {
+        if (parts.isEmpty() && !hasGcsParts) {
             // Amazon requires at least one part
             throw new S3Exception(S3ErrorCode.MALFORMED_X_M_L);
         }
@@ -2500,6 +2532,10 @@ public class S3ProxyHandler {
                 @Override
                 public void run() {
                     try {
+                        if (gcsRecursiveCombine) {
+                            combineGcsParts(blobStore, mpu, containerName,
+                                    metadata, options, parts);
+                        }
                         eTag.set(blobStore.completeMultipartUpload(mpu, parts));
                     } catch (RuntimeException re) {
                         exception.set(re);

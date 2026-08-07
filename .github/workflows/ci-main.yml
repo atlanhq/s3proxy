@@ -67,7 +67,7 @@ jobs:
       #Run tests
       - name: Maven Set version
         run: |
-          mvn versions:set -DnewVersion=${{ needs.meta.outputs.version }}
+          mvn versions:set -DnewVersion=${{ needs.meta.outputs.container_version }}
       - name: Maven Package
         run: |
           mvn verify -DskipTests
