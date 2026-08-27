@@ -135,7 +135,18 @@ import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 public final class GCloudBlobStore implements BlobStore {
-    private static final String STUB_BLOB_PREFIX = ".s3proxy/stubs/";
+    /**
+     * Key prefix for multipart scratch: the stub, every uploaded part, and
+     * the intermediate compose objects.
+     *
+     * Overridable because a deployment whose credentials are scoped to a key
+     * prefix cannot write outside it, and the default sits at the bucket root.
+     * Such a caller can hold exactly the rights it needs for the objects it
+     * actually stores and still be unable to begin a multipart upload. Point
+     * this inside the prefix the credentials already cover.
+     */
+    private static final String STUB_BLOB_PREFIX = System.getProperty(
+            "s3proxy.stub-prefix", ".s3proxy/stubs/");
     private static final String TARGET_BLOB_NAME_KEY =
             "s3proxy_target_blob_name";
     private static final String BLOB_ACCESS_KEY = "s3proxy_blob_access";
