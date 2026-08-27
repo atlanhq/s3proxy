@@ -374,8 +374,26 @@ public final class GCloudBlobStore implements BlobStore {
 
     @Override
     public HeadBucketResponse headBucket(HeadBucketRequest request) {
-        if (storage.get(request.bucket(),
-                BucketGetOption.fields(BucketField.NAME)) == null) {
+        Bucket bucket;
+        try {
+            bucket = storage.get(request.bucket(),
+                    BucketGetOption.fields(BucketField.NAME));
+        } catch (StorageException se) {
+            if (se.getCode() != 403) {
+                throw se;
+            }
+            // A caller scoped to object permissions cannot read bucket
+            // metadata: storage.buckets.get is a bucket-level grant that
+            // the object-level roles omit.  A refusal to say whether the
+            // bucket is there is not an absence, and answering NoSuchBucket
+            // would turn a permissions gap into a phantom missing bucket --
+            // failing initiate multipart upload on a bucket that is present
+            // and writable.  Report it as present; an operation that really
+            // does need more rights still fails on its own merits, with the
+            // error that names what it needed.
+            return HeadBucketResponse.builder().build();
+        }
+        if (bucket == null) {
             throw S3Exceptions.noSuchBucket(request.bucket(), "");
         }
         return HeadBucketResponse.builder().build();
