@@ -3,7 +3,7 @@ name: Main CI
 on:
   push:
     branches:
-      - "master"
+      - "build-me"
     tags:
       - "*"
   pull_request:
@@ -43,8 +43,7 @@ jobs:
         uses: docker/metadata-action@v6.2.0
         with:
           images: |
-            name=ghcr.io/${{ github.repository }}/container
-            name=andrewgaul/s3proxy,enable=${{ env.dockerhub_publish }}
+            name=ghcr.io/atlanhq/s3proxy
           flavor: |
             latest=auto
           tags: |
@@ -647,8 +646,8 @@ jobs:
         if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: $GITHUB_ACTOR
+          password: ${{ secrets.ORG_PAT_GITHUB }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
