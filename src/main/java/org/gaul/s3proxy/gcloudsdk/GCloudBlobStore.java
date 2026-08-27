@@ -33,6 +33,7 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -1468,6 +1469,25 @@ public final class GCloudBlobStore implements BlobStore {
         }
     }
 
+    /**
+     * Whether a StorageException reports that object ACLs are unavailable
+     * because the bucket uses uniform bucket-level access.
+     *
+     * Such buckets reject listAcls with 400 rather than returning an empty
+     * ACL set, so a caller asking who may read an object gets an error where
+     * the honest answer is "nobody in particular" -- access is decided by IAM
+     * on the bucket.  PRIVATE is the closest canned ACL, and is what initiate
+     * multipart upload already assumes for these buckets.
+     */
+    private static boolean isUniformBucketLevelAccess(StorageException se) {
+        if (se.getCode() != 400) {
+            return false;
+        }
+        String message = se.getMessage();
+        return message != null && message.toLowerCase(Locale.ROOT)
+                .contains("uniform bucket-level access");
+    }
+
     @Override
     public ObjectCannedACL getBlobAccess(String container, String key) {
         try {
@@ -1485,6 +1505,9 @@ public final class GCloudBlobStore implements BlobStore {
                     throw S3Exceptions.noSuchBucket(container, "");
                 }
                 throw S3Exceptions.noSuchKey(container, key, "");
+            }
+            if (isUniformBucketLevelAccess(se)) {
+                return ObjectCannedACL.PRIVATE;
             }
             // The emulator returns ACL responses the SDK cannot deserialize
             // (StorageException with no HTTP status, code 0); tolerate those
@@ -1515,6 +1538,9 @@ public final class GCloudBlobStore implements BlobStore {
         } catch (StorageException se) {
             if (se.getCode() == 404) {
                 throw S3Exceptions.noSuchKey(container, key, "");
+            }
+            if (isUniformBucketLevelAccess(se)) {
+                return ObjectCannedACL.PRIVATE;
             }
             // The emulator returns ACL responses the SDK cannot deserialize
             // (StorageException with no HTTP status, code 0); tolerate those
