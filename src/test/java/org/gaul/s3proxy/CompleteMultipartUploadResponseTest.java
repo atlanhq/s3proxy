@@ -30,6 +30,7 @@ import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.AmazonS3Exception;
 import com.amazonaws.services.s3.model.CompleteMultipartUploadRequest;
+import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
 import com.amazonaws.services.s3.model.InitiateMultipartUploadRequest;
 import com.amazonaws.services.s3.model.PartETag;
 import com.amazonaws.services.s3.model.UploadPartRequest;
@@ -47,13 +48,17 @@ import org.junit.Before;
 import org.junit.Test;
 
 /**
- * A completion that fails after the status is committed must still give the
- * client a whole response it can classify, not a truncated result body.
+ * The complete response is written while the backend completes, after the
+ * status is committed: a slow completion must still parse as a result, and a
+ * failed one as an error, never a truncated body.
  */
-public final class CompleteMultipartUploadErrorTest {
+public final class CompleteMultipartUploadResponseTest {
     private static final String CONTAINER = "container";
+    /** Long enough for the handler to send at least one keepalive. */
+    private static final long SLOW_COMPLETE_MILLIS = 2500;
 
     private BlobStoreContext context;
+    private CompleteBlobStore blobStore;
     private S3Proxy s3Proxy;
     private AmazonS3 client;
 
@@ -64,8 +69,7 @@ public final class CompleteMultipartUploadErrorTest {
                 .credentials("identity", "credential")
                 .modules(List.of(new SLF4JLoggingModule()))
                 .build(BlobStoreContext.class);
-        BlobStore blobStore = new FailingCompleteBlobStore(
-                context.getBlobStore());
+        blobStore = new CompleteBlobStore(context.getBlobStore());
         blobStore.createContainerInLocation(null, CONTAINER);
 
         s3Proxy = S3Proxy.builder()
@@ -100,7 +104,35 @@ public final class CompleteMultipartUploadErrorTest {
     }
 
     @Test
+    public void testSlowCompletionReturnsTheResult() {
+        blobStore.delayMillis = SLOW_COMPLETE_MILLIS;
+
+        CompleteMultipartUploadResult result = client.completeMultipartUpload(
+                uploadOnePart());
+
+        assertThat(result.getETag()).isNotEmpty();
+        assertThat(blobStore.blobExists(CONTAINER, "object")).isTrue();
+    }
+
+    @Test
     public void testFailedCompletionReturnsAnErrorDocument() {
+        blobStore.fail = true;
+
+        AmazonS3Exception e = null;
+        try {
+            client.completeMultipartUpload(uploadOnePart());
+        } catch (AmazonS3Exception ase) {
+            e = ase;
+        }
+
+        assertThat(e).isNotNull();
+        assertThat(e.getStatusCode()).isEqualTo(200);
+        assertThat(e.getErrorCode()).isEqualTo(
+                S3ErrorCode.INTERNAL_ERROR.getErrorCode());
+        assertThat(e.getErrorMessage()).doesNotContain("compose");
+    }
+
+    private CompleteMultipartUploadRequest uploadOnePart() {
         String uploadId = client.initiateMultipartUpload(
                 new InitiateMultipartUploadRequest(CONTAINER, "object"))
                 .getUploadId();
@@ -113,32 +145,32 @@ public final class CompleteMultipartUploadErrorTest {
                 .withInputStream(new ByteArrayInputStream(content))
                 .withPartSize(content.length))
                 .getPartETag();
-
-        AmazonS3Exception e = null;
-        try {
-            client.completeMultipartUpload(new CompleteMultipartUploadRequest(
-                    CONTAINER, "object", uploadId, List.of(partETag)));
-        } catch (AmazonS3Exception ase) {
-            e = ase;
-        }
-
-        assertThat(e).isNotNull();
-        assertThat(e.getStatusCode()).isEqualTo(200);
-        assertThat(e.getErrorCode()).isEqualTo(
-                S3ErrorCode.INTERNAL_ERROR.getErrorCode());
-        assertThat(e.getErrorMessage()).doesNotContain("compose");
+        return new CompleteMultipartUploadRequest(CONTAINER, "object",
+                uploadId, List.of(partETag));
     }
 
-    private static final class FailingCompleteBlobStore
-            extends ForwardingBlobStore {
-        FailingCompleteBlobStore(BlobStore blobStore) {
+    /** Completes after {@code delayMillis}, or fails when {@code fail}. */
+    private static final class CompleteBlobStore extends ForwardingBlobStore {
+        private volatile long delayMillis;
+        private volatile boolean fail;
+
+        CompleteBlobStore(BlobStore blobStore) {
             super(blobStore);
         }
 
         @Override
         public String completeMultipartUpload(MultipartUpload mpu,
                 List<MultipartPart> parts) {
-            throw new IllegalStateException("compose failed");
+            if (fail) {
+                throw new IllegalStateException("compose failed");
+            }
+            try {
+                Thread.sleep(delayMillis);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(ie);
+            }
+            return super.completeMultipartUpload(mpu, parts);
         }
     }
 }
