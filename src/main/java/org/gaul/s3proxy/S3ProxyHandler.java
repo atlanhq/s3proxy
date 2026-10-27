@@ -115,6 +115,8 @@ import org.slf4j.LoggerFactory;
 
 /** HTTP server-independent handler for S3 requests. */
 public class S3ProxyHandler {
+    /** GCS compose accepts at most this many source objects per request. */
+    static final int GCS_COMPOSE_MAX_SOURCES = 32;
     private static final Logger logger = LoggerFactory.getLogger(
             S3ProxyHandler.class);
     private static final String AWS_XMLNS =
@@ -2352,17 +2354,23 @@ public class S3ProxyHandler {
     }
 
     /**
-     * Combine GCS multipart parts into per-group composite objects.
+     * Combine GCS multipart parts until at most
+     * {@code GCS_COMPOSE_MAX_SOURCES} objects remain, and return the upload
+     * whose completion composes them into the final object.
      *
      * GCS compose accepts at most 32 sources, so uploadPart groups parts
      * 32-at-a-time under {@code <uploadId>_<group>} and this combines each
-     * group into one object, yielding the parts for the final compose.
+     * group into one object.  While more than 32 objects remain, they are
+     * composed 32 at a time into {@code <uploadId>_L<level>_<n>}; stopping
+     * after the groups capped an upload at 32 x 32 = 1,024 parts.  On return,
+     * {@code parts} holds the remaining objects, numbered as parts of the
+     * returned upload.
      *
      * This is O(parts) sequential round trips -- ~2000 for a 12 GiB upload at
      * 8 MiB parts -- so callers must run it where the client is being kept
      * alive, not before the response has started.
      */
-    private static void combineGcsParts(BlobStore blobStore,
+    static MultipartUpload combineGcsParts(BlobStore blobStore,
             MultipartUpload mpu, String containerName, BlobMetadata metadata,
             PutOptions options, List<MultipartPart> parts) {
         for (int partNumber = 1;; ++partNumber) {
@@ -2383,6 +2391,36 @@ public class S3ProxyHandler {
             parts.add(MultipartPart.create(
                     partNumber, partSize, eTag, /*lastModified=*/ null));
         }
+
+        String sourceId = mpu.id();
+        for (int level = 2; parts.size() > GCS_COMPOSE_MAX_SOURCES; ++level) {
+            String targetId = String.format("%s_L%d", mpu.id(), level);
+            List<MultipartPart> combined = new ArrayList<>();
+            for (int i = 0; i < parts.size(); i += GCS_COMPOSE_MAX_SOURCES) {
+                List<MultipartPart> batch = new ArrayList<>(parts.subList(i,
+                        Math.min(i + GCS_COMPOSE_MAX_SOURCES, parts.size())));
+                int partNumber = combined.size() + 1;
+                // jclouds composes the objects <sourceId>_<partNumber> into
+                // the upload's blob name and deletes them.
+                MultipartUpload batchMpu = MultipartUpload.create(
+                        containerName,
+                        String.format("%s_%08d", targetId, partNumber),
+                        sourceId, metadata, options);
+                long partSize = 0;
+                for (MultipartPart part : batch) {
+                    partSize += part.partSize();
+                }
+                String eTag = blobStore.completeMultipartUpload(batchMpu,
+                        batch);
+                combined.add(MultipartPart.create(
+                        partNumber, partSize, eTag, /*lastModified=*/ null));
+            }
+            parts.clear();
+            parts.addAll(combined);
+            sourceId = targetId;
+        }
+        return MultipartUpload.create(containerName, mpu.blobName(),
+                sourceId, metadata, options);
     }
 
     private void handleCompleteMultipartUpload(HttpServletRequest request,
@@ -2532,11 +2570,13 @@ public class S3ProxyHandler {
                 @Override
                 public void run() {
                     try {
+                        MultipartUpload finalMpu = mpu;
                         if (gcsRecursiveCombine) {
-                            combineGcsParts(blobStore, mpu, containerName,
-                                    metadata, options, parts);
+                            finalMpu = combineGcsParts(blobStore, mpu,
+                                    containerName, metadata, options, parts);
                         }
-                        eTag.set(blobStore.completeMultipartUpload(mpu, parts));
+                        eTag.set(blobStore.completeMultipartUpload(finalMpu,
+                                parts));
                     } catch (RuntimeException re) {
                         exception.set(re);
                     }
@@ -2544,11 +2584,13 @@ public class S3ProxyHandler {
             };
             thread.start();
 
+            // The root element waits until the outcome is known: the status is
+            // committed by the first keepalive, so a failure can only be
+            // reported as an <Error> body, as S3 does for this call.  Newlines
+            // after the XML declaration are valid whitespace.
             XMLStreamWriter xml = xmlOutputFactory.createXMLStreamWriter(
                     writer);
             xml.writeStartDocument();
-            xml.writeStartElement("CompleteMultipartUploadResult");
-            xml.writeDefaultNamespace(AWS_XMLNS);
             xml.flush();
 
             while (thread.isAlive()) {
@@ -2562,8 +2604,22 @@ public class S3ProxyHandler {
             }
 
             if (exception.get() != null) {
-                throw exception.get();
+                logger.error("Failed to complete multipart upload {} of" +
+                        " {}/{}", uploadId, containerName, blobName,
+                        exception.get());
+                xml.writeStartElement("Error");
+                writeSimpleElement(xml, "Code",
+                        S3ErrorCode.INTERNAL_ERROR.getErrorCode());
+                writeSimpleElement(xml, "Message",
+                        S3ErrorCode.INTERNAL_ERROR.getMessage());
+                writeSimpleElement(xml, "RequestId", FAKE_REQUEST_ID);
+                xml.writeEndElement();
+                xml.flush();
+                return;
             }
+
+            xml.writeStartElement("CompleteMultipartUploadResult");
+            xml.writeDefaultNamespace(AWS_XMLNS);
 
             if (Quirks.MULTIPART_REQUIRES_STUB.contains(getBlobStoreType(
                     blobStore))) {
